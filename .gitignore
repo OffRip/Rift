@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
+info.env
+
+# Runtime state (NEVER commit)
+state.json
+paper_state.json
+controls.json
+universe.json
+rift.pid
+rift.log
+
+# Optional scratch / experiments
+test_exchanges.py
+
