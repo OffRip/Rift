@@ -1091,12 +1091,18 @@ class RiftEngine:
                                     "last": last,
                                     "unreal": 0.0,
                                 }
+                                # Only run post-BE giveback if the trade actually reached meaningful green
                                 if p.get("be_armed", False) and not p.get("trail_active", False):
-                                    post_be_giveback = max(tp_dollars * POST_BE_GIVEBACK_FRACTION, MIN_POST_BE_GIVEBACK)
                                     peak = float(p.get("peak_unreal", unreal))
-                                    if unreal < (peak - post_be_giveback):
-                                        close_position(state, pid, last, "POST_BE_GIVEBACK_EXIT")
-                                        continue
+
+                                    # ✅ must have hit at least BE level once
+                                    if peak >= be_trigger:
+                                        post_be_giveback = max(tp_dollars * POST_BE_GIVEBACK_TP_FRACTION, MIN_POST_BE_GIVEBACK_DOLLARS)
+
+                                        # ✅ only exit while still green (never 0 / negative)
+                                        if unreal > 0 and unreal <= (peak - post_be_giveback):
+                                            close_position(state, pid, last, "POST_BE_PROFIT_LOCK_EXIT")
+                                            continue
 
                                 LOG.info(f"[OPEN] {ex_name} {symbol} entry={last:.2f} qty={qty:.6f} profile={prof_now}")
                                 open_symbols.add(symbol)
