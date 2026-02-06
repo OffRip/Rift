@@ -19,6 +19,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+# TEST_SYNC = 1
 
 # ------------------------------------------------------------
 # OUTPUT / LOGGING (backend visibility)
