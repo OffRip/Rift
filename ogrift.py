@@ -1,3 +1,4 @@
+import atexit
 import os
 import sys
 import json
@@ -163,6 +164,32 @@ STABLE_BASE_SUBSTRINGS = ("USD", "USDT", "USDC", "DAI", "EUR")
 HEARTBEAT_SECONDS = 30
 
 _shutdown_signal = False
+# ------------------------------------------------------------
+# SINGLE-INSTANCE LOCKFILE
+# ------------------------------------------------------------
+LOCKFILE_PATH = os.path.join(BASE_DIR, "rift.lock")
+_lock_fd = None
+
+
+def acquire_lock():
+    global _lock_fd
+    try:
+        _lock_fd = os.open(LOCKFILE_PATH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(_lock_fd, str(os.getpid()).encode())
+    except FileExistsError:
+        print("[RIFT] ❌ Another instance is already running. Exiting.")
+        sys.exit(1)
+
+
+def release_lock():
+    global _lock_fd
+    try:
+        if _lock_fd is not None:
+            os.close(_lock_fd)
+        if os.path.exists(LOCKFILE_PATH):
+            os.remove(LOCKFILE_PATH)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -176,6 +203,7 @@ def _handle_shutdown(sig, frame):
 
 signal.signal(signal.SIGINT, _handle_shutdown)
 signal.signal(signal.SIGTERM, _handle_shutdown)
+atexit.register(release_lock)
 
 
 # ============================================================
@@ -1369,10 +1397,15 @@ async def post_init(app):
 
 
 def main():
+    acquire_lock()
     if not os.path.exists(CONTROLS_FILE):
         save_controls(default_controls())
     if not os.path.exists(STATE_FILE):
         save_state(default_state())
+        # DEV MODE GATE: prevent Telegram polling on non-runner machines
+    if os.getenv("RUN_TELEGRAM", "1") != "1":
+        LOG.info("[RIFT] RUN_TELEGRAM=0 -> Telegram controller disabled")
+        return
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 

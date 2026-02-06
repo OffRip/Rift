@@ -16,7 +16,8 @@ controls.json
 universe.json
 rift.pid
 rift.log
-
+rift.lock
 # Optional scratch / experiments
 test_exchanges.py
 
+rift.lock
