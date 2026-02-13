@@ -6,6 +6,8 @@ import time
 import signal
 import asyncio
 import logging
+import argparse
+import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -48,6 +50,7 @@ if not BOT_TOKEN:
 STATE_FILE = str(BASE_DIR / "state.json")
 CONTROLS_FILE = str(BASE_DIR / "controls.json")
 UNIVERSE_FILE = str(BASE_DIR / "universe.json")
+TRADE_LOG_FILE = os.getenv('RIFT_TRADE_LOG_FILE', str(BASE_DIR / 'trades.jsonl'))  # append-only forensic log (json per line)
 # ----------------------------
 # Exit Intelligence Enhancements
 # ----------------------------
@@ -74,6 +77,63 @@ PEG_GUARD_ENABLED = True
 PEG_PRICE_LOW = 0.98
 PEG_PRICE_HIGH = 1.02
 PEG_ATR_PCT_MAX = 0.0015  # 0.15% ATR (very stable)
+
+# ------------------------------------------------------------
+# PRICE SANITY / DUST + LIQUIDITY / SPREAD GUARDS (integrity)
+# ------------------------------------------------------------
+MIN_PRICE_FLOOR = 0.0005           # blocks near-zero "dust" assets slipping into positions (ex: LUNC/USD)
+MAX_LEADING_ZEROS = 3              # blocks 0.0000xxxx prices
+MIN_NOTIONAL_USD = 5.00            # avoid dust orders / tiny fills
+MIN_24H_QUOTE_VOL_USD = 250000.0   # liquidity floor for entries (USD-ish quote volume)
+MAX_SPREAD_PCT = 0.004
+# Fees (taker, round-trip). If exchange provides market taker fee, we use it; otherwise default.
+DEFAULT_TAKER_FEE_RATE = 0.0010     # 0.10% per side (typical spot taker)
+INCLUDE_FEES_IN_PNL = True          # net PnL includes fees; exits evaluate net unreal too
+
+# Exchange order constraints (precision/limits)
+ENFORCE_MARKET_LIMITS = True
+MIN_COST_FALLBACK_USD = 5.00        # if exchange doesn't report min cost
+MIN_AMOUNT_FALLBACK = 0.0           # if exchange doesn't report min amount
+
+# Equity curve guardrails (beyond cold stand-down): throttle exposure + raise entry threshold when under water
+EQUITY_GUARD_LOOKBACK_TRADES = 50
+EQUITY_GUARD_MIN_TRADES = 15
+EQUITY_GUARD_MIN_EXPOSURE_MULT = 0.40   # never go below 40% of normal exposure
+EQUITY_GUARD_SCORE_BUMP_MAX = 0.08      # add up to +0.08 to ENTER_SCORE when in drawdown
+EQUITY_GUARD_DD_SOFT = 0.02             # 2% drawdown -> start throttling
+EQUITY_GUARD_DD_HARD = 0.06             # 6% drawdown -> max throttle
+             # 0.40% mid spread; blocks thin books / slippage traps
+
+# ------------------------------------------------------------
+# GOVERNORS
+# ------------------------------------------------------------
+# 1) Regime Authority (governs entries)
+REGIME_MIN_TREND_SCORE = 0.55
+REGIME_MAX_VOL_SPIKE = 2.25        # ATR_now / ATR_baseline
+REGIME_COOLDOWN_SECONDS = 120
+
+# 2) Score + Persistence (hysteresis + minimum streak; no flip-flop)
+ENTER_SCORE = 0.78
+EXIT_SCORE = 0.62
+PERSIST_TICKS_REQUIRED = 3
+CANDIDATE_TTL_SECONDS = 90
+
+# 3) Performance-aware gating ("cold bot" stands down)
+COLD_MIN_TRADES = 12
+COLD_LOOKBACK = 25
+COLD_MAX_DD_PCT = 0.035
+COLD_MIN_EXPECTANCY_USD = -0.25
+COLD_STANDDOWN_SECONDS = 20 * 60
+
+# ------------------------------------------------------------
+# BE/TRAIL Tight Gates (prevents BE/profit-lock triggering when peak ~ 0)
+# ------------------------------------------------------------
+BE_MIN_PEAK_USD = 2.00
+BE_ARM_AT_PROFIT_USD = 1.00
+BE_MIN_HOLD_SECONDS = 45
+TRAIL_MIN_PEAK_USD = 3.50
+TRAIL_MIN_HOLD_SECONDS = 45
+
 
 # ----------------------------
 # AUTO RISK PROFILE (SMALL <-> STANDARD) with hysteresis
@@ -228,6 +288,103 @@ def save_json(path: str, data):
 
 
 # ============================================================
+# FORENSIC TRADE LOG (append-only jsonl)
+# ============================================================
+def append_trade_log(evt: Dict[str, Any]) -> None:
+    try:
+        evt = dict(evt)
+        evt["ts"] = int(evt.get("ts", time.time()))
+        with open(TRADE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(evt, separators=(",", ":")) + "\n")
+    except Exception:
+        # never crash engine because logging failed
+        pass
+
+
+def load_recent_trades(n: int = 200) -> List[Dict[str, Any]]:
+    if not os.path.exists(TRADE_LOG_FILE):
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+        return out[-n:]
+    except Exception:
+        return out[-n:]
+
+
+def compute_perf_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not trades:
+        return {"n": 0}
+
+    recent = trades[-COLD_LOOKBACK:]
+    n = len(recent)
+
+    pnls = [float(t.get("pnl", 0.0)) for t in recent if t.get("evt") == "CLOSE"]
+    if not pnls:
+        return {"n": 0}
+
+    wins = [p for p in pnls if p > 0]
+    losses = [-p for p in pnls if p < 0]
+
+    win_rate = (len(wins) / len(pnls)) if pnls else 0.0
+    avg_win = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0.0
+    expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
+
+    # simple drawdown estimate from cumulative pnl
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for p in pnls:
+        cum += p
+        peak = max(peak, cum)
+        max_dd = min(max_dd, cum - peak)  # negative
+    max_dd_abs = abs(max_dd)
+
+    return {
+        "n": len(pnls),
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "max_dd_abs": max_dd_abs,
+    }
+
+
+def perf_allows_entries(state: Dict[str, Any], now_ts: int) -> Tuple[bool, str]:
+    perf = state.get("perf", {}) or {}
+    cold_until = int(perf.get("cold_until", 0) or 0)
+    if now_ts < cold_until:
+        return False, "COLD_STANDDOWN_ACTIVE"
+
+    trades = load_recent_trades(300)
+    metrics = compute_perf_metrics(trades)
+    perf["last_metrics"] = metrics
+    state["perf"] = perf
+
+    if metrics.get("n", 0) < COLD_MIN_TRADES:
+        return True, "WARMING_UP"
+
+    # drawdown% proxy: DD relative to recent profit potential (avoid div by 0)
+    denom = max(1.0, abs(metrics.get("avg_win", 1.0)) * max(1, metrics.get("n", 1)))
+    dd_pct = float(metrics.get("max_dd_abs", 0.0)) / denom
+
+    if dd_pct >= COLD_MAX_DD_PCT or float(metrics.get("expectancy", 0.0)) <= COLD_MIN_EXPECTANCY_USD:
+        perf["cold_until"] = now_ts + int(COLD_STANDDOWN_SECONDS)
+        state["perf"] = perf
+        return False, "COLD_TRIGGERED"
+
+    return True, "PERF_OK"
+
+# ============================================================
 # STATE / CONTROLS
 # ============================================================
 def default_state() -> Dict[str, Any]:
@@ -238,26 +395,89 @@ def default_state() -> Dict[str, Any]:
         "cooldowns": {},      # symbol -> unix_ts
         "risk_profile": "STANDARD",  # persisted for hysteresis stability
 
-        # optional (safe defaults if absent)
-        "regime_ok": True,
-        "regime_last_msg": "",
+        # governors (persist for restart integrity)
+        "regime": {"ok": True, "label": "UNKNOWN", "score": 0.0, "reason": "", "last_block_ts": 0},
+        "candidates": {},
+        "perf": {"cold_until": 0, "last_metrics": {}},
+        "loss_clusters": {},
     }
 
 
+
+
+def update_equity_guard(state: Dict[str, Any], now_ts: int) -> None:
+    """Throttle exposure + raise entry threshold when equity is below its recent peak."""
+    eg = state.get("equity_guard", {}) or {}
+
+    # Initialize equity_start if missing
+    if "equity_start" not in state:
+        state["equity_start"] = float(state.get("equity", 0.0))
+
+    trades = load_recent_trades(max(300, EQUITY_GUARD_LOOKBACK_TRADES + 50))
+    closes = [t for t in trades if (t or {}).get("evt") == "CLOSE"]
+
+    if len(closes) < int(EQUITY_GUARD_MIN_TRADES):
+        state["exposure_mult"] = 1.0
+        state["score_bump"] = 0.0
+        eg.update({"dd_pct": 0.0, "peak_equity": float(state.get("equity", 0.0)), "updated_ts": now_ts})
+        state["equity_guard"] = eg
+        return
+
+    # Reconstruct equity curve from equity_start + net pnl
+    eq0 = float(state.get("equity_start", 0.0))
+    eq = eq0
+    peak = eq0
+    dd_pct = 0.0
+    for t in closes[-int(EQUITY_GUARD_LOOKBACK_TRADES):]:
+        eq += float(t.get("pnl", 0.0))
+        peak = max(peak, eq)
+        if peak > 0:
+            dd_pct = max(dd_pct, (peak - eq) / peak)
+
+    dd_pct = float(dd_pct)
+    # Map drawdown to throttles
+    if dd_pct <= float(EQUITY_GUARD_DD_SOFT):
+        exposure_mult = 1.0
+        score_bump = 0.0
+    else:
+        span = max(1e-9, float(EQUITY_GUARD_DD_HARD) - float(EQUITY_GUARD_DD_SOFT))
+        p = min(1.0, (dd_pct - float(EQUITY_GUARD_DD_SOFT)) / span)
+        exposure_mult = 1.0 - p * (1.0 - float(EQUITY_GUARD_MIN_EXPOSURE_MULT))
+        exposure_mult = max(float(EQUITY_GUARD_MIN_EXPOSURE_MULT), min(1.0, exposure_mult))
+        score_bump = p * float(EQUITY_GUARD_SCORE_BUMP_MAX)
+
+    state["exposure_mult"] = float(exposure_mult)
+    state["score_bump"] = float(score_bump)
+
+    eg.update({"dd_pct": dd_pct, "peak_equity": peak, "updated_ts": now_ts})
+    state["equity_guard"] = eg
 def load_state() -> Dict[str, Any]:
     s = load_json(STATE_FILE, default_state())
     base = default_state()
     if isinstance(s, dict):
         base.update(s)
+
     base["positions"] = base.get("positions", {}) or {}
     base["cooldowns"] = base.get("cooldowns", {}) or {}
+    base["candidates"] = base.get("candidates", {}) or {}
+    base["perf"] = base.get("perf", {}) or {"cold_until": 0, "last_metrics": {}}
+    base["loss_clusters"] = base.get("loss_clusters", {}) or {}
+
     base["equity"] = float(base.get("equity", START_EQUITY_USD))
     base["realized_pnl"] = float(base.get("realized_pnl", 0.0))
+
     rp = base.get("risk_profile", "STANDARD")
     base["risk_profile"] = rp if rp in ("SMALL", "STANDARD") else "STANDARD"
-    base["regime_ok"] = bool(base.get("regime_ok", True))
-    base["regime_last_msg"] = str(base.get("regime_last_msg", "") or "")
+
+    reg = base.get("regime", {}) or {"ok": True, "label": "UNKNOWN", "score": 0.0, "reason": "", "last_block_ts": 0}
+    base["regime"] = reg
+
+    # backward-compatible fields used by telegram renderers
+    base["regime_ok"] = bool(reg.get("ok", True))
+    base["regime_last_msg"] = str(reg.get("reason", "") or "")
+
     return base
+
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -357,7 +577,8 @@ def get_position_value(state: Dict[str, Any]) -> Tuple[float, str]:
 
     total = float(SMALL_TOTAL_EXPOSURE) if prof == "SMALL" else float(STD_TOTAL_EXPOSURE)
     # Option A: spread total exposure across max slots (so raising slots doesn't multiply exposure)
-    per_trade = (eq * total) / float(MAX_OPEN_POSITIONS)
+    ex_mult = float(state.get('exposure_mult', 1.0) or 1.0)
+    per_trade = ((eq * total) / float(MAX_OPEN_POSITIONS)) * ex_mult
     return per_trade, prof
 
 
@@ -511,6 +732,314 @@ def _quote_volume_usdish(t: dict) -> float:
         pass
     return 0.0
 
+
+# ============================================================
+# ENTRY GOVERNOR HELPERS
+# ============================================================
+def _leading_zeros_after_decimal(px: float) -> int:
+    s = f"{px:.12f}"
+    if "." not in s:
+        return 0
+    frac = s.split(".", 1)[1]
+    count = 0
+    for ch in frac:
+        if ch == "0":
+            count += 1
+        else:
+            break
+    return count
+
+
+def pass_price_sanity(symbol: str, last_px: float, quote_vol_usd: Optional[float]) -> Tuple[bool, str]:
+    if last_px is None or last_px <= 0:
+        return False, "PRICE_INVALID"
+    if float(last_px) < float(MIN_PRICE_FLOOR):
+        return False, f"PRICE_FLOOR_BLOCK<{MIN_PRICE_FLOOR}"
+    if _leading_zeros_after_decimal(float(last_px)) > int(MAX_LEADING_ZEROS):
+        return False, "PRICE_DUST_LEADING_ZEROS"
+    if quote_vol_usd is not None and float(quote_vol_usd) < float(MIN_24H_QUOTE_VOL_USD):
+        return False, f"LIQUIDITY_BLOCK<{MIN_24H_QUOTE_VOL_USD}"
+    return True, "OK"
+
+
+def spread_pct_from_ticker(t: dict) -> Optional[float]:
+    try:
+        bid = t.get("bid")
+        ask = t.get("ask")
+        if bid is None or ask is None:
+            return None
+        bid = float(bid)
+        ask = float(ask)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        mid = (bid + ask) / 2.0
+        return (ask - bid) / mid if mid > 0 else None
+    except Exception:
+        return None
+
+
+def get_taker_fee_rate(ex, symbol: str) -> float:
+    """Best-effort taker fee rate (per side)."""
+    try:
+        m = ex.market(symbol) if ex else None
+        if isinstance(m, dict):
+            r = m.get("taker")
+            if r is not None:
+                r = float(r)
+                if r >= 0:
+                    return r
+    except Exception:
+        pass
+    return float(DEFAULT_TAKER_FEE_RATE)
+
+
+def normalize_order_qty(ex, symbol: str, qty: float, price: float) -> Tuple[Optional[float], str]:
+    """Apply exchange precision + limits (amount/cost). Returns (qty, reason)."""
+    if qty is None or qty <= 0 or price <= 0:
+        return None, "QTY_INVALID"
+
+    q = float(qty)
+    try:
+        if hasattr(ex, "amount_to_precision"):
+            q = float(ex.amount_to_precision(symbol, q))
+    except Exception:
+        q = float(q)
+
+    if q <= 0:
+        return None, "QTY_PRECISION_ZERO"
+
+    if not ENFORCE_MARKET_LIMITS:
+        return q, "OK"
+
+    try:
+        m = ex.market(symbol)
+        limits = (m or {}).get("limits", {}) if isinstance(m, dict) else {}
+        amount_lim = limits.get("amount", {}) if isinstance(limits, dict) else {}
+        cost_lim = limits.get("cost", {}) if isinstance(limits, dict) else {}
+
+        min_amt = amount_lim.get("min")
+        min_cost = cost_lim.get("min")
+
+        if min_amt is None:
+            min_amt = float(MIN_AMOUNT_FALLBACK)
+        if min_cost is None:
+            min_cost = float(MIN_COST_FALLBACK_USD)
+
+        if min_amt is not None and float(min_amt) > 0 and q < float(min_amt):
+            return None, f"AMOUNT_MIN<{float(min_amt)}"
+
+        notional = q * float(price)
+        if min_cost is not None and float(min_cost) > 0 and notional < float(min_cost):
+            return None, f"COST_MIN<{float(min_cost)}"
+
+    except Exception:
+        notional = q * float(price)
+        if notional < float(MIN_COST_FALLBACK_USD):
+            return None, f"COST_MIN_FALLBACK<{float(MIN_COST_FALLBACK_USD)}"
+
+    return q, "OK"
+
+
+def calc_net_unreal(p: Dict[str, Any], last: float, fee_rate: float) -> float:
+    """Net unreal PnL estimate (includes paid open fee + estimated exit fee)."""
+    entry = float(p.get("entry", 0.0))
+    qty = float(p.get("qty", 0.0))
+    gross = (float(last) - entry) * qty
+
+    if not INCLUDE_FEES_IN_PNL:
+        return gross
+
+    fee_open = float(p.get("fee_open", 0.0))
+    fee_exit_est = float(last) * qty * float(fee_rate)
+    return gross - fee_open - fee_exit_est
+
+
+def compute_features_from_candles(candles: List[List[float]]) -> Optional[Dict[str, Any]]:
+        if not candles or len(candles) < max(EMA_SLOW + 5, RSI_PERIOD + 5, ATR_PERIOD + 5):
+            return None
+
+        closes = [float(c[4]) for c in candles if c and len(c) >= 6]
+        vols = [float(c[5]) for c in candles if c and len(c) >= 6]
+        if len(closes) < max(EMA_SLOW + 5, RSI_PERIOD + 5):
+            return None
+
+        last = closes[-1]
+        ef = ema_last(closes, EMA_FAST)
+        es = ema_last(closes, EMA_SLOW)
+        r = rsi_last(closes, RSI_PERIOD)
+        atr = atr_last(candles, ATR_PERIOD)
+
+        if ef is None or es is None or r is None or atr is None or last <= 0:
+            return None
+
+        # ATR baseline: average ATR over last ~3x period
+        # (no numpy; simple slice)
+        baseline_window = max(ATR_PERIOD * 3, ATR_PERIOD + 1)
+        atrs = []
+        for i in range(len(candles) - baseline_window, len(candles)):
+            if i <= 0:
+                continue
+            window = candles[: i + 1]
+            a = atr_last(window, ATR_PERIOD)
+            if a is not None:
+                atrs.append(float(a))
+        atr_base = sum(atrs) / len(atrs) if atrs else float(atr)
+
+        atr_ratio = float(atr) / float(atr_base) if atr_base > 0 else 1.0
+
+        # trend_score in [0..1] from EMA separation + RSI location
+        ema_sep = (float(ef) - float(es)) / float(last)
+        ema_component = max(0.0, min(1.0, (ema_sep * 500.0)))  # scaled
+        rsi_component = 0.0
+        if float(r) >= RSI_MIN and float(r) <= RSI_MAX:
+            # closer to middle of band => higher
+            mid = (RSI_MIN + RSI_MAX) / 2.0
+            dist = abs(float(r) - mid) / (RSI_MAX - RSI_MIN)
+            rsi_component = max(0.0, 1.0 - dist)
+        trend_score = max(0.0, min(1.0, 0.6 * ema_component + 0.4 * rsi_component))
+
+        # regime label
+        if atr_ratio > float(REGIME_MAX_VOL_SPIKE):
+            regime = {"label": "BLOCK", "reason": "VOL_SPIKE", "score": 0.0}
+        elif trend_score < float(REGIME_MIN_TREND_SCORE):
+            regime = {"label": "BLOCK", "reason": "CHOP", "score": float(trend_score)}
+        else:
+            regime = {"label": "ALLOW", "reason": "TREND", "score": float(trend_score)}
+
+        # entry score in [0..1]
+        # requires ef>es, price above es, RSI in band
+        hard_ok = (ef > es) and (last > es) and (RSI_MIN <= r <= RSI_MAX)
+        if not hard_ok:
+            score = 0.0
+        else:
+            # score boosts with trend_score but penalize high atr_ratio (instability)
+            vol_penalty = max(0.0, min(0.5, (atr_ratio - 1.0) * 0.25))
+            score = max(0.0, min(1.0, float(trend_score) - vol_penalty))
+
+        # PEG GUARD
+        peg_block = False
+        if PEG_GUARD_ENABLED and atr is not None and last > 0:
+            atr_pct = float(atr) / float(last)
+            if PEG_PRICE_LOW <= float(last) <= PEG_PRICE_HIGH and atr_pct <= float(PEG_ATR_PCT_MAX):
+                peg_block = True
+
+        return {
+            "last": float(last),
+            "ef": float(ef),
+            "es": float(es),
+            "rsi": float(r),
+            "atr": float(atr),
+            "atr_ratio": float(atr_ratio),
+            "trend_score": float(trend_score),
+            "score": float(score),
+            "regime": regime,
+            "peg_block": peg_block,
+            "vol_lookback": float(sum(vols[-10:])) if vols else 0.0,
+        }
+
+
+def compute_features(ex, symbol: str) -> Optional[Dict[str, Any]]:
+    candles = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+    return compute_features_from_candles(candles)
+
+
+def regime_allows_entry(state: Dict[str, Any], now_ts: int, regime: Dict[str, Any]) -> Tuple[bool, str]:
+    reg_state = state.get("regime", {}) or {"ok": True, "label": "UNKNOWN", "score": 0.0, "reason": "", "last_block_ts": 0}
+    label = str(regime.get("label", "BLOCK"))
+    reason = str(regime.get("reason", ""))
+    score = float(regime.get("score", 0.0))
+
+    if label != "ALLOW":
+        reg_state["ok"] = False
+        reg_state["label"] = label
+        reg_state["reason"] = reason
+        reg_state["score"] = score
+        reg_state["last_block_ts"] = now_ts
+        state["regime"] = reg_state
+        state["regime_ok"] = False
+        state["regime_last_msg"] = reason
+        return False, f"REGIME_BLOCK:{reason}"
+
+    # cooldown after a block to avoid flip-flop regime
+    last_block = int(reg_state.get("last_block_ts", 0) or 0)
+    if last_block and (now_ts - last_block) < int(REGIME_COOLDOWN_SECONDS):
+        reg_state["ok"] = True
+        reg_state["label"] = "ALLOW"
+        reg_state["reason"] = f"COOLDOWN({now_ts - last_block}s)"
+        reg_state["score"] = score
+        state["regime"] = reg_state
+        state["regime_ok"] = True
+        state["regime_last_msg"] = reg_state["reason"]
+        return False, "REGIME_COOLDOWN"
+
+    reg_state["ok"] = True
+    reg_state["label"] = "ALLOW"
+    reg_state["reason"] = reason
+    reg_state["score"] = score
+    state["regime"] = reg_state
+    state["regime_ok"] = True
+    state["regime_last_msg"] = reason
+    return True, "REGIME_OK"
+
+
+def update_candidate(state: Dict[str, Any], symbol: str, score: float, now_ts: int) -> Tuple[bool, str]:
+    cands = state.get("candidates", {}) or {}
+    c = cands.get(symbol)
+    if not isinstance(c, dict):
+        c = {"streak": 0, "best": 0.0, "first_ts": now_ts, "last_ts": now_ts}
+        cands[symbol] = c
+
+    if (now_ts - int(c.get("last_ts", now_ts))) > int(CANDIDATE_TTL_SECONDS):
+        c["streak"] = 0
+        c["best"] = 0.0
+        c["first_ts"] = now_ts
+
+    c["last_ts"] = now_ts
+    c["best"] = max(float(c.get("best", 0.0)), float(score))
+
+    enter_th = float(ENTER_SCORE) + float(state.get('score_bump', 0.0) or 0.0)
+    exit_th = float(EXIT_SCORE)  # keep hysteresis stable
+
+    if float(score) >= enter_th:
+        c["streak"] = int(c.get("streak", 0)) + 1
+    elif float(score) <= exit_th:
+        c["streak"] = 0
+        c["best"] = float(score)
+
+    cands[symbol] = c
+    state["candidates"] = cands
+
+    if int(c.get("streak", 0)) >= int(PERSIST_TICKS_REQUIRED):
+        # consume to prevent repeated triggers
+        try:
+            del cands[symbol]
+        except Exception:
+            pass
+        state["candidates"] = cands
+        return True, "PERSISTENCE_OK"
+
+    return False, "PERSISTING"
+
+
+def classify_loss_reason(trade: Dict[str, Any]) -> str:
+    reason = str(trade.get("reason", ""))
+    if "SL_" in reason:
+        # attempt to classify
+        if trade.get("spread_pct") is not None and float(trade["spread_pct"]) > float(MAX_SPREAD_PCT):
+            return "low_liquidity_slippage"
+        reg_reason = str(trade.get("regime_reason", ""))
+        if "CHOP" in reg_reason or "CHOP" in str(trade.get("regime_label", "")):
+            return "chop"
+        if "VOL_SPIKE" in reg_reason:
+            return "volatility_spike"
+        return "stop_loss"
+    if "TRAIL" in reason:
+        return "trail_giveback"
+    if "BE" in reason:
+        return "break_even"
+    if "STAG" in reason or "EOG" in reason:
+        return "stagnation"
+    return "other"
 
 def build_symbol_lists(exchanges: Dict[str, Any]) -> Tuple[Dict[str, List[str]], List[str]]:
     by_ex: Dict[str, List[str]] = {}
@@ -685,23 +1214,65 @@ def fetch_last(ex, symbol: str) -> float:
     return float(last)
 
 
+
 def close_position(state: Dict[str, Any], pid: str, exit_price: float, reason: str) -> None:
     p = state["positions"][pid]
     entry = float(p["entry"])
     qty = float(p["qty"])
     symbol = p["symbol"]
+    now_ts = int(state.get("_now", int(time.time())))
 
-    pnl = (exit_price - entry) * qty
-    state["equity"] += pnl
-    state["realized_pnl"] += pnl
+    fee_rate = float(p.get("fee_rate", DEFAULT_TAKER_FEE_RATE))
+    gross_pnl = (float(exit_price) - entry) * qty
 
-    state["cooldowns"][symbol] = int(time.time()) + COOLDOWN_SECONDS
+    fee_open = float(p.get("fee_open", 0.0)) if INCLUDE_FEES_IN_PNL else 0.0
+    fee_exit = (float(exit_price) * qty * fee_rate) if INCLUDE_FEES_IN_PNL else 0.0
+    net_pnl = gross_pnl - fee_open - fee_exit
+
+    state["equity"] += net_pnl
+    state["realized_pnl"] += net_pnl
+
+    state["cooldowns"][symbol] = now_ts + int(COOLDOWN_SECONDS)
 
     LOG.info(
-        f"[CLOSE] {p['exchange']} {symbol} entry={entry:.2f} exit={exit_price:.2f} "
-        f"qty={qty:.6f} pnl={pnl:+.2f} reason={reason}"
+        f"[CLOSE] {p['exchange']} {symbol} entry={entry:.6f} exit={float(exit_price):.6f} "
+        f"qty={qty:.6f} pnl={net_pnl:+.2f} gross={gross_pnl:+.2f} fees={fee_open+fee_exit:+.2f} reason={reason}"
     )
+
+    close_evt = {
+        "evt": "CLOSE",
+        "ts": now_ts,
+        "exchange": p.get("exchange"),
+        "symbol": symbol,
+        "entry": entry,
+        "exit": float(exit_price),
+        "qty": qty,
+        "pnl": net_pnl,
+        "gross_pnl": gross_pnl,
+        "fee_open": fee_open,
+        "fee_exit": fee_exit,
+        "fee_rate": fee_rate,
+        "reason": reason,
+        "hold_s": now_ts - int(p.get("opened_ts", now_ts)),
+        "score": p.get("entry_score"),
+        "trend_score": p.get("entry_trend_score"),
+        "atr_ratio": p.get("entry_atr_ratio"),
+        "rsi": p.get("entry_rsi"),
+        "spread_pct": p.get("entry_spread_pct"),
+        "qv": p.get("entry_qv"),
+        "regime_label": p.get("regime_label"),
+        "regime_reason": p.get("regime_reason"),
+    }
+    append_trade_log(close_evt)
+
+    if net_pnl < 0:
+        loss_reason = classify_loss_reason({**close_evt, "reason": reason})
+        clusters = state.get("loss_clusters", {}) or {}
+        clusters[loss_reason] = int(clusters.get(loss_reason, 0)) + 1
+        state["loss_clusters"] = clusters
+
     del state["positions"][pid]
+
 
 
 def close_all_positions(state: Dict[str, Any], exchanges: Dict[str, Any], reason: str) -> None:
@@ -798,6 +1369,7 @@ class RiftEngine:
 
             while not _shutdown_signal:
                 now = int(time.time())
+                state['_now'] = now
                 controls = load_controls()
 
                 batch_size = int(controls.get("batch_size", BATCH_SIZE_DEFAULT))
@@ -858,11 +1430,15 @@ class RiftEngine:
 
                     try:
                         last = fetch_last(ex, p["symbol"])
-                        unreal = (last - float(p["entry"])) * float(p["qty"])
+                        fee_rate = float(p.get("fee_rate", get_taker_fee_rate(ex, p["symbol"])))
+                        unreal_gross = (last - float(p["entry"])) * float(p["qty"])
+                        unreal = calc_net_unreal(p, last, fee_rate)
 
                         # seed/normalize fields
                         p["last"] = last
+                        p["unreal_gross"] = unreal_gross
                         p["unreal"] = unreal
+                        p["fee_rate"] = fee_rate
                         # --------
                         # PEAK TRACKING (always, even before trailing)
                         # --------
@@ -892,13 +1468,17 @@ class RiftEngine:
                         # --------
                         # BREAK-EVEN (BE)
                         # --------
-                        if not p.get("be_armed", False) and unreal >= be_trigger:
-                            p["be_armed"] = True
-                            p["be_armed_ts"] = now
-                            LOG.info(
-                                f"[RIFT] BE ARMED {p['exchange']} {p['symbol']} unreal={unreal:+.2f} "
-                                f"(exit if <= {BE_EXIT_UNREAL_DOLLARS:+.2f})"
-                            )
+                        if (not p.get("be_armed", False)):
+                            # Only arm BE after: min hold time AND meaningful peak AND meaningful profit
+                            age_s = now - int(p.get("opened_ts", now))
+                            peak = float(p.get("peak_unreal", unreal))
+                            if age_s >= int(BE_MIN_HOLD_SECONDS) and peak >= float(BE_MIN_PEAK_USD) and unreal >= max(float(be_trigger), float(BE_ARM_AT_PROFIT_USD)):
+                                p["be_armed"] = True
+                                p["be_armed_ts"] = now
+                                LOG.info(
+                                    f"[RIFT] BE ARMED {p['exchange']} {p['symbol']} unreal={unreal:+.2f} peak={peak:+.2f} "
+                                    f"(exit if <= {float(BE_EXIT_UNREAL_DOLLARS):+.2f})"
+                                )
                         # --------
                         # POST-BE PROFIT LOCK (prevents BE -> back to $0 donation)
                         # --------
@@ -907,12 +1487,12 @@ class RiftEngine:
                                 tp_dollars * POST_BE_GIVEBACK_TP_FRACTION,
                                 MIN_POST_BE_GIVEBACK_DOLLARS,
                             )
-
                             peak = float(p.get("peak_unreal", unreal))
-
-                            if unreal <= (peak - post_be_giveback) and unreal > 0:
-                                 close_position(state, pid, last, "POST_BE_PROFIT_LOCK_EXIT")
-                                 continue
+                            # Gate profit lock so it cannot fire on tiny/no peak
+                            if peak >= float(BE_MIN_PEAK_USD) and peak >= float(be_trigger):
+                                if unreal <= (peak - post_be_giveback) and unreal > 0:
+                                    close_position(state, pid, last, "POST_BE_PROFIT_LOCK_EXIT")
+                                    continue
 
                         if p.get("be_armed", False) and unreal <= float(BE_EXIT_UNREAL_DOLLARS):
                             close_position(state, pid, last, "BE_EXIT")
@@ -922,48 +1502,54 @@ class RiftEngine:
                         # TRAILING (ATR + Momentum Aware)
                         # --------
                         if unreal >= trail_trigger:
-                            candles = ex.fetch_ohlcv(p["symbol"], timeframe=TIMEFRAME, limit=ATR_PERIOD + 20)
-                            closes = [float(c[4]) for c in candles]
-                            volumes = [float(c[5]) for c in candles]
+                            age_s = now - int(p.get('opened_ts', now))
+                            peak = float(p.get('peak_unreal', unreal))
+                            if age_s < int(TRAIL_MIN_HOLD_SECONDS) or peak < float(TRAIL_MIN_PEAK_USD):
+                                # too early / too small to trail
+                                pass
+                            else:
+                                candles = ex.fetch_ohlcv(p["symbol"], timeframe=TIMEFRAME, limit=ATR_PERIOD + 20)
+                                closes = [float(c[4]) for c in candles]
+                                volumes = [float(c[5]) for c in candles]
 
-                            atr = atr_last(candles, ATR_PERIOD)
-                            ef = ema_last(closes, EMA_FAST)
-                            es = ema_last(closes, EMA_SLOW)
-                            rsi = rsi_last(closes, RSI_PERIOD)
+                                atr = atr_last(candles, ATR_PERIOD)
+                                ef = ema_last(closes, EMA_FAST)
+                                es = ema_last(closes, EMA_SLOW)
+                                rsi = rsi_last(closes, RSI_PERIOD)
 
-                            weak = momentum_weak(closes, volumes, ef, es, rsi)
+                                weak = momentum_weak(closes, volumes, ef, es, rsi)
 
-                            atr_mult = ATR_MULT_TIGHT if weak else ATR_MULT_NORMAL
-                            dynamic_giveback = max(
-                                atr * atr_mult * p["qty"],
-                                trail_giveback
-                            )
-
-                            if not p.get("trail_active", False):
-                                p["trail_active"] = True
-                                p["peak_unreal"] = unreal
-                                p["trail_stop_unreal"] = unreal - dynamic_giveback
-                                LOG.info(
-                                    f"[RIFT] TRAIL ON {p['exchange']} {p['symbol']} "
-                                    f"unreal={unreal:+.2f} stop={p['trail_stop_unreal']:+.2f} weak={weak}"
+                                atr_mult = ATR_MULT_TIGHT if weak else ATR_MULT_NORMAL
+                                dynamic_giveback = max(
+                                    atr * atr_mult * p["qty"],
+                                    trail_giveback
                                 )
-                            else:
-                                if unreal > p["peak_unreal"]:
+
+                                if not p.get("trail_active", False):
+                                    p["trail_active"] = True
                                     p["peak_unreal"] = unreal
-                                    new_stop = unreal - dynamic_giveback
-                                    p["trail_stop_unreal"] = max(p["trail_stop_unreal"], new_stop)
+                                    p["trail_stop_unreal"] = unreal - dynamic_giveback
+                                    LOG.info(
+                                        f"[RIFT] TRAIL ON {p['exchange']} {p['symbol']} "
+                                        f"unreal={unreal:+.2f} stop={p['trail_stop_unreal']:+.2f} weak={weak}"
+                                    )
+                                else:
+                                    if unreal > p["peak_unreal"]:
+                                        p["peak_unreal"] = unreal
+                                        new_stop = unreal - dynamic_giveback
+                                        p["trail_stop_unreal"] = max(p["trail_stop_unreal"], new_stop)
 
-                            if unreal <= p["trail_stop_unreal"]:
-                                close_position(state, pid, last, "TRAIL_EXIT_DYNAMIC")
-                                continue
-                            atr_giveback = (atr * atr_mult * p["qty"])
+                                if unreal <= p["trail_stop_unreal"]:
+                                    close_position(state, pid, last, "TRAIL_EXIT_DYNAMIC")
+                                    continue
+                                atr_giveback = (atr * atr_mult * p["qty"])
 
-                            if weak:
-                                dynamic_giveback = max(MIN_TRAIL_GIVEBACK_DOLLARS, min(trail_giveback, atr_giveback))
-                            else:
-                                dynamic_giveback = max(trail_giveback, atr_giveback)
+                                if weak:
+                                    dynamic_giveback = max(MIN_TRAIL_GIVEBACK_DOLLARS, min(trail_giveback, atr_giveback))
+                                else:
+                                    dynamic_giveback = max(trail_giveback, atr_giveback)
 
-                        # --------
+                            # --------
                         # Exit-on-green armed state (stagnation system)
                         # --------
                         if p.get("eog_armed", False):
@@ -1036,7 +1622,18 @@ class RiftEngine:
                     scan = batched_symbols(ranked_symbols, batch_size, batch_i)
                     batch_i += 1
 
+                    update_equity_guard(state, now)
                     position_value, prof_now = get_position_value(state)
+
+                    # Governor: performance-aware gating (cold bot stands down)
+                    perf_ok, perf_msg = perf_allows_entries(state, now)
+                    if not perf_ok:
+                        # surface state for telegram + logs
+                        state['regime_ok'] = False
+                        state['regime_last_msg'] = perf_msg
+                        LOG.info(f"[RIFT] entry stand-down: {perf_msg}")
+                    else:
+                        state['regime_last_msg'] = ''
 
                     for symbol in scan:
                         if len(state["positions"]) >= MAX_OPEN_POSITIONS:
@@ -1058,14 +1655,53 @@ class RiftEngine:
                             if symbol not in by_ex_sets.get(ex_name, set()):
                                 continue
                             try:
-                                if not trend_ok(ex, symbol):
+                                # --- ticker (spread/liquidity/price sanity) ---
+                                t = ex.fetch_ticker(symbol)
+                                last = t.get("last")
+                                if last is None:
+                                    continue
+                                last = float(last)
+                                qv = _quote_volume_usdish(t)
+                                ok_price, why_price = pass_price_sanity(symbol, last, qv)
+                                if not ok_price:
                                     continue
 
-                                last = fetch_last(ex, symbol)
-                                if last <= 0:
+                                sp = spread_pct_from_ticker(t)
+                                if sp is not None and float(sp) > float(MAX_SPREAD_PCT):
                                     continue
 
-                                qty = position_value / last
+                                # Notional sanity
+                                if float(position_value) < float(MIN_NOTIONAL_USD):
+                                    continue
+
+                                # Governor: perf stand-down must pass
+                                if not perf_ok:
+                                    continue
+
+                                # --- compute features, score, regime ---
+                                feat = compute_features(ex, symbol)
+                                if not feat:
+                                    continue
+                                if feat.get("peg_block", False):
+                                    continue
+
+                                regime_ok, regime_msg = regime_allows_entry(state, now, feat.get("regime", {}))
+                                if not regime_ok:
+                                    continue
+
+                                score = float(feat.get("score", 0.0))
+                                persist_ok, persist_msg = update_candidate(state, symbol, score, now)
+                                if not persist_ok:
+                                    continue
+
+                                qty_raw = float(position_value) / last
+                                fee_rate = get_taker_fee_rate(ex, symbol)
+
+                                qty, qty_msg = normalize_order_qty(ex, symbol, qty_raw, last)
+                                if qty is None or qty <= 0:
+                                    continue
+
+                                fee_open = (float(qty) * float(last) * float(fee_rate)) if INCLUDE_FEES_IN_PNL else 0.0
 
                                 pid = f"{ex_name}:{symbol}:{now}"
                                 state["positions"][pid] = {
@@ -1073,6 +1709,8 @@ class RiftEngine:
                                     "symbol": symbol,
                                     "entry": last,
                                     "qty": qty,
+                                    "fee_rate": float(fee_rate),
+                                    "fee_open": float(fee_open),
                                     "opened_ts": now,
                                     "recovery_deadline": 0,
 
@@ -1087,30 +1725,47 @@ class RiftEngine:
                                     "peak_unreal": 0.0,
                                     "trail_stop_unreal": 0.0,
 
-                                    # seed heartbeat fields immediately
+                                    # heartbeat fields
                                     "last": last,
                                     "unreal": 0.0,
+
+                                    # forensic snapshot
+                                    "entry_score": score,
+                                    "entry_trend_score": float(feat.get("trend_score", 0.0)),
+                                    "entry_atr_ratio": float(feat.get("atr_ratio", 1.0)),
+                                    "entry_rsi": float(feat.get("rsi", 0.0)),
+                                    "entry_spread_pct": float(sp) if sp is not None else None,
+                                    "entry_qv": float(qv),
+                                    "regime_label": str((feat.get("regime") or {}).get("label", "")),
+                                    "regime_reason": str((feat.get("regime") or {}).get("reason", "")),
                                 }
-                                # Only run post-BE giveback if the trade actually reached meaningful green
-                                if p.get("be_armed", False) and not p.get("trail_active", False):
-                                    peak = float(p.get("peak_unreal", unreal))
 
-                                    # ✅ must have hit at least BE level once
-                                    if peak >= be_trigger:
-                                        post_be_giveback = max(tp_dollars * POST_BE_GIVEBACK_TP_FRACTION, MIN_POST_BE_GIVEBACK_DOLLARS)
+                                append_trade_log({
+                                    "evt": "OPEN",
+                                    "exchange": ex_name,
+                                    "symbol": symbol,
+                                    "entry": last,
+                                    "qty": qty,
+                                    "fee_rate": float(fee_rate),
+                                    "fee_open": float(fee_open),
+                                    "score": score,
+                                    "trend_score": float(feat.get("trend_score", 0.0)),
+                                    "atr_ratio": float(feat.get("atr_ratio", 1.0)),
+                                    "rsi": float(feat.get("rsi", 0.0)),
+                                    "spread_pct": float(sp) if sp is not None else None,
+                                    "qv": float(qv),
+                                    "regime_label": str((feat.get("regime") or {}).get("label", "")),
+                                    "regime_reason": str((feat.get("regime") or {}).get("reason", "")),
+                                })
 
-                                        # ✅ only exit while still green (never 0 / negative)
-                                        if unreal > 0 and unreal <= (peak - post_be_giveback):
-                                            close_position(state, pid, last, "POST_BE_PROFIT_LOCK_EXIT")
-                                            continue
-
-                                LOG.info(f"[OPEN] {ex_name} {symbol} entry={last:.2f} qty={qty:.6f} profile={prof_now}")
+                                LOG.info(f"[OPEN] {ex_name} {symbol} entry={last:.6f} qty={qty:.6f} score={score:.2f} profile={prof_now}")
                                 open_symbols.add(symbol)
                                 if ONE_BASE_ASSET_AT_A_TIME:
                                     open_bases.add(base_asset(symbol))
                                 break
                             except Exception:
                                 continue
+
 
                 save_state(state)
                 await asyncio.sleep(SCAN_INTERVAL)
@@ -1180,11 +1835,35 @@ def render_equity_text() -> str:
     regime_ok = bool(s.get("regime_ok", True))
     regime_msg = str(s.get("regime_last_msg", "") or "")
 
+    # Performance gating visibility
+    perf = s.get("perf", {}) or {}
+    cold_until = int(perf.get("cold_until", 0) or 0)
+    cold_active = int(time.time()) < cold_until
+    metrics = perf.get("last_metrics", {}) or {}
+    pf_txt = ""
+    if metrics.get("n", 0) > 0:
+        pf_txt = (
+            f" | win={metrics.get('win_rate', 0.0)*100:.0f}%"
+            f" avgW={metrics.get('avg_win', 0.0):.2f}"
+            f" avgL={metrics.get('avg_loss', 0.0):.2f}"
+            f" exp={metrics.get('expectancy', 0.0):+.2f}"
+            f" dd={metrics.get('max_dd_abs', 0.0):.2f}"
+        )
+
+    clusters = s.get("loss_clusters", {}) or {}
+    top_losses = sorted(clusters.items(), key=lambda kv: int(kv[1]), reverse=True)[:3]
+    loss_txt = ""
+    if top_losses:
+        loss_txt = " | loss_clusters=" + ",".join([f"{k}:{v}" for k, v in top_losses])
+
+
     txt = (
         f"profile={prof} | equity=${s.get('equity', 0):,.2f} | realized=${s.get('realized_pnl', 0):,.2f} | "
         f"unreal=${unreal_total:+,.2f} | tp=${tp_d:+.2f} sl=${sl_d:+.2f} | "
         f"BE@{be_trigger:+.2f} TRAIL@{trail_trigger:+.2f} giveback={trail_giveback:.2f} | "
         f"one_base={ONE_BASE_ASSET_AT_A_TIME} | regime={'OK' if regime_ok else 'BAD'}"
+        f" | perf={'COLD' if cold_active else 'OK'}"
+        f"{pf_txt}{loss_txt}"
     )
     if regime_msg:
         txt += f"\nREGIME: {regime_msg}"
@@ -1403,13 +2082,262 @@ async def post_init(app):
     LOG.info("[TELEGRAM] controller online (master ogrift.py)")
 
 
+
+# ============================================================
+# REPLAY / BACKTEST HARNESS (deterministic, single-symbol)
+# ============================================================
+def run_replay_mode(
+    exchange_name: str,
+    symbol: str,
+    since_ms: Optional[int],
+    limit: int,
+    starting_equity: float,
+    assumed_spread_pct: float,
+) -> None:
+    ex = getattr(ccxt, exchange_name)(
+        {"enableRateLimit": True, "options": {"defaultType": "spot", "loadAllOptions": False}}
+    )
+    ex.load_markets(False)
+
+    # Isolate replay logs from live
+    if not os.getenv("RIFT_TRADE_LOG_FILE"):
+        os.environ["RIFT_TRADE_LOG_FILE"] = str(BASE_DIR / "trades_replay.jsonl")
+
+    state = default_state()
+    state["equity"] = float(starting_equity)
+    state["equity_start"] = float(starting_equity)
+    state["positions"] = {}
+    state["cooldowns"] = {}
+    state["candidates"] = {}
+    state["loss_clusters"] = {}
+    state["perf"] = {}
+
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, since=since_ms, limit=int(limit))
+    if not ohlcv or len(ohlcv) < (CANDLE_LIMIT + 10):
+        raise RuntimeError(f"Not enough candles for replay: got {len(ohlcv) if ohlcv else 0}")
+
+    # Warmup index: need enough candles for indicators
+    warmup = max(CANDLE_LIMIT, EMA_SLOW + 10, RSI_PERIOD + 10, ATR_PERIOD + 10)
+
+    def _ticker_from_close(close_px: float) -> dict:
+        mid = float(close_px)
+        # symmetric spread around mid
+        half = float(assumed_spread_pct) / 2.0
+        bid = mid * (1.0 - half)
+        ask = mid * (1.0 + half)
+        return {"bid": bid, "ask": ask, "last": mid}
+
+    for i in range(warmup, len(ohlcv)):
+        ts_ms = int(ohlcv[i][0])
+        now_ts = int(ts_ms // 1000)
+        state["_now"] = now_ts
+
+        # Equity guardrails update (uses replay trade log)
+        update_equity_guard(state, now_ts)
+
+        # --- exits ---
+        tp_dollars, sl_dollars, _prof = get_tp_sl_dollars(state)
+        be_trigger, trail_trigger, trail_giveback = get_be_trail_params(state)
+
+        for pid in list(state["positions"].keys()):
+            p = state["positions"][pid]
+            if p.get("symbol") != symbol:
+                continue
+
+            last = float(ohlcv[i][4])
+            fee_rate = float(p.get("fee_rate", get_taker_fee_rate(ex, symbol)))
+            unreal_gross = (last - float(p["entry"])) * float(p["qty"])
+            unreal = calc_net_unreal(p, last, fee_rate)
+            p["last"] = last
+            p["unreal_gross"] = unreal_gross
+            p["unreal"] = unreal
+            p["fee_rate"] = fee_rate
+
+            # peak tracking on net unreal
+            prev_peak = float(p.get("peak_unreal", unreal))
+            p["peak_unreal"] = max(prev_peak, float(unreal))
+
+            # TP/SL (net)
+            if unreal >= float(tp_dollars):
+                close_position(state, pid, last, f"TP_{_prof}")
+                continue
+            if unreal <= float(sl_dollars):
+                close_position(state, pid, last, f"SL_{_prof}")
+                continue
+
+            # BE arm (tight-gated)
+            if not p.get("be_armed", False):
+                age_s = now_ts - int(p.get("opened_ts", now_ts))
+                peak = float(p.get("peak_unreal", unreal))
+                if age_s >= int(BE_MIN_HOLD_SECONDS) and peak >= float(BE_MIN_PEAK_USD) and unreal >= max(float(be_trigger), float(BE_ARM_AT_PROFIT_USD)):
+                    p["be_armed"] = True
+                    p["be_armed_ts"] = now_ts
+
+            # Trailing activate + update stop
+            if not p.get("trail_active", False):
+                if float(p.get("peak_unreal", unreal)) >= float(trail_trigger) and float(p.get("peak_unreal", unreal)) >= float(BE_MIN_PEAK_USD):
+                    p["trail_active"] = True
+                    p["trail_stop_unreal"] = float(p.get("peak_unreal", unreal)) - float(trail_giveback)
+            if p.get("trail_active", False):
+                peak = float(p.get("peak_unreal", unreal))
+                stop = float(p.get("trail_stop_unreal", 0.0))
+                new_stop = max(stop, peak - float(trail_giveback))
+                p["trail_stop_unreal"] = new_stop
+                if unreal <= float(new_stop) and peak >= float(BE_MIN_PEAK_USD):
+                    close_position(state, pid, last, "TRAIL_EXIT")
+                    continue
+
+            # Post-BE profit-lock (only if peak is meaningful)
+            if p.get("be_armed", False):
+                peak = float(p.get("peak_unreal", unreal))
+                if peak >= max(float(BE_MIN_PEAK_USD), float(be_trigger)) and unreal <= float(BE_EXIT_UNREAL_DOLLARS) and unreal > 0:
+                    close_position(state, pid, last, "POST_BE_PROFIT_LOCK")
+                    continue
+
+            # Stagnation + exit-on-green
+            opened = int(p.get("opened_ts", now_ts))
+            if (now_ts - opened) >= int(MAX_HOLD_SECONDS):
+                if not p.get("recovery_deadline"):
+                    p["recovery_deadline"] = now_ts + int(RECOVERY_WINDOW_SECONDS)
+                if now_ts >= int(p.get("recovery_deadline", 0)):
+                    if EXIT_ON_GREEN_AFTER_STAG_TIMEOUT:
+                        if not p.get("eog_armed", False):
+                            p["eog_armed"] = True
+                            p["eog_armed_ts"] = now_ts
+                        if float(unreal) > float(EXIT_ON_GREEN_MIN_UNREAL):
+                            close_position(state, pid, last, "EOG_EXIT")
+                            continue
+                    else:
+                        close_position(state, pid, last, "STAG_TIMEOUT_EXIT")
+                        continue
+
+        # --- entries ---
+        # Performance gate
+        perf_ok, _perf_msg = perf_allows_entries(state, now_ts)
+        if not perf_ok:
+            continue
+
+        # Cooldown
+        if int(state.get("cooldowns", {}).get(symbol, 0)) > now_ts:
+            continue
+        if len(state["positions"]) >= int(MAX_OPEN_POSITIONS):
+            continue
+        if ONE_BASE_ASSET_AT_A_TIME:
+            open_bases = {base_asset(pos["symbol"]) for pos in state["positions"].values()}
+            b = base_asset(symbol)
+            if b and b in open_bases:
+                continue
+
+        last = float(ohlcv[i][4])
+        t = _ticker_from_close(last)
+        qv = float(ohlcv[i][5]) * float(last)  # volume * price ~= quote volume
+        ok_price, _why = pass_price_sanity(symbol, last, qv)
+        if not ok_price:
+            continue
+
+        sp = spread_pct_from_ticker(t)
+        if sp is not None and float(sp) > float(MAX_SPREAD_PCT):
+            continue
+
+        position_value, _ = get_position_value(state)
+        if float(position_value) < float(MIN_NOTIONAL_USD):
+            continue
+
+        candles_slice = ohlcv[max(0, i - CANDLE_LIMIT + 1) : i + 1]
+        feat = compute_features_from_candles(candles_slice)
+        if not feat or feat.get("peg_block", False):
+            continue
+
+        regime_ok, _ = regime_allows_entry(state, now_ts, feat.get("regime", {}))
+        if not regime_ok:
+            continue
+
+        score = float(feat.get("score", 0.0))
+        persist_ok, _ = update_candidate(state, symbol, score, now_ts)
+        if not persist_ok:
+            continue
+
+        qty_raw = float(position_value) / last
+        fee_rate = get_taker_fee_rate(ex, symbol)
+        qty, _ = normalize_order_qty(ex, symbol, qty_raw, last)
+        if qty is None:
+            continue
+        fee_open = (float(qty) * float(last) * float(fee_rate)) if INCLUDE_FEES_IN_PNL else 0.0
+
+        pid = f"REPLAY:{symbol}:{now_ts}"
+        state["positions"][pid] = {
+            "exchange": "REPLAY",
+            "symbol": symbol,
+            "entry": last,
+            "qty": float(qty),
+            "fee_rate": float(fee_rate),
+            "fee_open": float(fee_open),
+            "opened_ts": now_ts,
+            "recovery_deadline": 0,
+            "eog_armed": False,
+            "eog_armed_ts": 0,
+            "be_armed": False,
+            "be_armed_ts": 0,
+            "trail_active": False,
+            "peak_unreal": 0.0,
+            "trail_stop_unreal": 0.0,
+            "last": last,
+            "unreal": 0.0,
+            "entry_score": score,
+            "entry_trend_score": float(feat.get("trend_score", 0.0)),
+            "entry_atr_ratio": float(feat.get("atr_ratio", 1.0)),
+            "entry_rsi": float(feat.get("rsi", 0.0)),
+            "entry_spread_pct": float(sp) if sp is not None else None,
+            "entry_qv": float(qv),
+            "regime_label": str((feat.get("regime") or {}).get("label", "")),
+            "regime_reason": str((feat.get("regime") or {}).get("reason", "")),
+        }
+        append_trade_log({"evt": "OPEN", "ts": now_ts, "exchange": "REPLAY", "symbol": symbol, "entry": last, "qty": float(qty), "fee_rate": float(fee_rate), "fee_open": float(fee_open), "score": score})
+
+    LOG.info(f"[REPLAY] done. equity=${state.get('equity', 0.0):,.2f} realized=${state.get('realized_pnl', 0.0):,.2f} open={len(state.get('positions', {}))}")
+
 def main():
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--replay", action="store_true", help="Run deterministic replay/backtest mode (no Telegram).")
+    parser.add_argument("--exchange", type=str, default=(EXCHANGE_NAMES[0] if EXCHANGE_NAMES else "bybit"), help="CCXT exchange id")
+    parser.add_argument("--symbol", type=str, default="", help="Symbol for replay (e.g., BTC/USDT)")
+    parser.add_argument("--since", type=str, default="", help="Since time (YYYY-MM-DD) for replay")
+    parser.add_argument("--limit", type=int, default=1500, help="Candles to fetch for replay")
+    parser.add_argument("--equity", type=float, default=10000.0, help="Starting equity for replay")
+    parser.add_argument("--spread", type=float, default=0.001, help="Assumed spread pct for replay (e.g. 0.001=0.10%)")
+    parser.add_argument("--logfile", type=str, default="", help="Replay trade log file (jsonl).")
+    args, _ = parser.parse_known_args()
+
+    if args.replay:
+        if not args.symbol:
+            raise SystemExit("Replay requires --symbol (e.g., BTC/USDT)")
+        if args.logfile:
+            os.environ["RIFT_TRADE_LOG_FILE"] = args.logfile
+
+        since_ms = None
+        if args.since:
+            # interpret as UTC date
+            dt = datetime.datetime.strptime(args.since, "%Y-%m-%d")
+            since_ms = int(dt.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+        run_replay_mode(
+            exchange_name=args.exchange,
+            symbol=args.symbol,
+            since_ms=since_ms,
+            limit=int(args.limit),
+            starting_equity=float(args.equity),
+            assumed_spread_pct=float(args.spread),
+        )
+        return
+
+    # Live mode (Telegram-driven engine)
     acquire_lock()
     if not os.path.exists(CONTROLS_FILE):
         save_controls(default_controls())
     if not os.path.exists(STATE_FILE):
         save_state(default_state())
-        # DEV MODE GATE: prevent Telegram polling on non-runner machines
+
+    # DEV MODE GATE: prevent Telegram polling on non-runner machines
     if os.getenv("RUN_TELEGRAM", "1") != "1":
         LOG.info("[RIFT] RUN_TELEGRAM=0 -> Telegram controller disabled")
         return
@@ -1434,4 +2362,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
